@@ -247,18 +247,19 @@ export function createCollection<Schema extends SchemaDeclaration>(
                     ? undefined
                     : (options?.onInsert ??
                       (async ({ transaction }) => {
-                          await Promise.all(
+                          const created = await Promise.all(
                               transaction.mutations.map(async mutation => {
                                   const {
-                                      created,
-                                      updated,
-                                      collectionId,
-                                      collectionName: _,
+                                      created: _created,
+                                      updated: _updated,
+                                      collectionId: _collectionId,
+                                      collectionName: _collectionName,
                                       ...data
                                   } = mutation.modified as unknown as Record<string, unknown>
-                                  await pb.collection(collectionName).create(data)
+                                  return pb.collection(collectionName).create(data)
                               })
                           )
+                          writeServerRecords(created)
                           return { refetch: refetchOnMutation }
                       })),
             onUpdate:
@@ -266,14 +267,15 @@ export function createCollection<Schema extends SchemaDeclaration>(
                     ? undefined
                     : (options?.onUpdate ??
                       (async ({ transaction }) => {
-                          await Promise.all(
+                          const updated = await Promise.all(
                               transaction.mutations.map(async mutation => {
                                   const recordWithId = mutation.original as { id: string }
-                                  await pb
+                                  return pb
                                       .collection(collectionName)
                                       .update(recordWithId.id, mutation.changes)
                               })
                           )
+                          writeServerRecords(updated)
                           return { refetch: refetchOnMutation }
                       })),
             onDelete:
@@ -293,6 +295,59 @@ export function createCollection<Schema extends SchemaDeclaration>(
 
         const collection = createTanStackCollection(collectionOptions)
 
+        // Read the PocketBase `updated` autodate from a record, if present.
+        // Collections without an `updated` field opt out of staleness checks.
+        function recordUpdatedAt(record: unknown): string | undefined {
+            const updated = (record as { updated?: unknown } | null | undefined)?.updated
+            return typeof updated === 'string' && updated !== '' ? updated : undefined
+        }
+
+        // A server record is stale relative to the synced store when an entry for
+        // the same key already holds a strictly-newer `updated` timestamp. PocketBase
+        // can redeliver or reorder realtime echoes (and a slow mutation response can
+        // resolve after a newer echo), so applying an older write would revert the
+        // row. ISO 8601 timestamps sort lexicographically, so string comparison is
+        // chronological. When either side lacks a comparable timestamp we cannot
+        // tell, so we treat the write as fresh and let it through.
+        function isStaleServerRecord(record: unknown): boolean {
+            const id = (record as { id?: unknown } | null | undefined)?.id
+            if (typeof id !== 'string') return false
+            const incoming = recordUpdatedAt(record)
+            if (!incoming) return false
+            const current = recordUpdatedAt(
+                collection._state.syncedData.get(id) as RecordType | undefined
+            )
+            return current !== undefined && incoming < current
+        }
+
+        // Write authoritative server records (mutation responses or realtime echoes)
+        // into the synced store, dropping any that the store already supersedes.
+        // No-op until the collection is ready: writing into the synced store before
+        // sync has initialized throws, and with no live query there is nothing to
+        // keep in sync — the next query fetches the already-persisted state.
+        function writeServerRecords(records: RecordType[]): void {
+            if (!collection.utils || !collection.isReady()) return
+            const fresh = records.filter(record => !isStaleServerRecord(record))
+            if (fresh.length === 0) return
+            collection.utils.writeUpsert(fresh)
+        }
+
+        // Decide whether a realtime echo should be dropped as stale. Under realtime
+        // contention PocketBase can redeliver or reorder events, so an echo carrying
+        // a pre-mutation value can arrive after the row already moved on (e.g. the
+        // local mutation that just wrote the fresh value back). Applying a
+        // strictly-older create/update echo would revert the row, so it is ignored.
+        // Deletes are terminal and not timestamp-guarded.
+        function isStaleEcho(event: RecordSubscription<RecordType>): boolean {
+            if (event.action !== 'create' && event.action !== 'update') return false
+            if (!isStaleServerRecord(event.record)) return false
+            logger.debug('Ignoring stale realtime echo', {
+                collectionName,
+                id: (event.record as { id?: string } | undefined)?.id,
+            })
+            return true
+        }
+
         // Real-time subscription state
         let unsubscribeFn: (() => Promise<void>) | null = null
         let isSubscribed = false
@@ -309,6 +364,7 @@ export function createCollection<Schema extends SchemaDeclaration>(
         // So only the delete branch can throw, and we make it idempotent below.
         const handleRealtimeEvent = (event: RecordSubscription<RecordType>) => {
             if (!collection.utils) return
+            if (isStaleEcho(event)) return
 
             try {
                 collection.utils.writeBatch(() => {

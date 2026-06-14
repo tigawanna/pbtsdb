@@ -398,10 +398,11 @@ export interface CreateCollectionOptions<
 
     /**
      * If true, refetch the entire collection after a successful insert,
-     * update, or delete. Defaults to false: pbtsdb relies on its PocketBase
-     * realtime subscription to deliver server-confirmed rows. Set true if
-     * you do not trust realtime to reconcile in time (e.g. flaky socket,
-     * server-side hooks producing fields you must read synchronously).
+     * update, or delete. Defaults to false: the built-in insert/update handlers
+     * write the server response straight back into the synced layer, and the
+     * realtime subscription reconciles everything else. Set true if you do not
+     * trust realtime to reconcile in time (e.g. flaky socket, server-side hooks
+     * producing fields you must read synchronously).
      *
      * Only affects the built-in default handlers. If you supply your own
      * onInsert/onUpdate/onDelete, you control the return value yourself.
